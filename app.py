@@ -81,13 +81,23 @@ st.markdown("""
     .pill-abs { background-color: #fef2f2; color: #b91c1c; border: 1px solid #fecaca; } 
     .pill-ship { background-color: #f0fdf4; color: #15803d; border: 1px solid #bbf7d0; } 
 
-    /* 聊天室氣泡優化 */
+    /* 聊天室氣泡 */
     .stChatMessage { background-color: white; border-radius: 10px; border: 1px solid #e2e8f0; }
     
-    /* ★ 關鍵 CSS：調整聊天輸入框的層級，確保它浮在最上面 ★ */
+    /* 輸入框固定底部 */
     section[data-testid="stBottomBlock"] {
         background-color: #f8fafc;
         padding-bottom: 20px;
+    }
+    
+    /* 免責聲明文字 */
+    .disclaimer-text {
+        font-size: 0.8rem; color: #64748b; line-height: 1.5;
+    }
+    
+    /* 分頁按鈕樣式 */
+    div.stButton > button {
+        width: 100%; border-radius: 8px; font-weight: bold;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -122,7 +132,7 @@ st.markdown(f"""
 tab1, tab2, tab3 = st.tabs(["🏠 現場庫存", "💬 AI 購車顧問", "🔮 猜你喜歡"])
 
 # ==========================================
-# Tab 1: 傳統列表
+# Tab 1: 現場庫存 (含按鈕式分頁)
 # ==========================================
 with tab1:
     col1, col2 = st.columns([3, 1])
@@ -136,10 +146,24 @@ with tab1:
     if filtered_df.empty:
         st.warning("無符合車輛。")
     else:
-        st.caption(f"找到 {len(filtered_df)} 台車")
-        for i in range(0, min(len(filtered_df), 12), 3):
+        # --- 分頁計算 ---
+        ITEMS_PER_PAGE = 12
+        if 'page_number' not in st.session_state: st.session_state.page_number = 1
+        total_pages = math.ceil(len(filtered_df) / ITEMS_PER_PAGE)
+        if st.session_state.page_number > total_pages: st.session_state.page_number = 1
+
+        # 頂部小資訊
+        st.caption(f"共找到 {len(filtered_df)} 台車 | 目前第 {st.session_state.page_number} / {total_pages} 頁")
+
+        # 切割資料
+        start_idx = (st.session_state.page_number - 1) * ITEMS_PER_PAGE
+        end_idx = start_idx + ITEMS_PER_PAGE
+        display_df = filtered_df.iloc[start_idx:end_idx]
+
+        # 顯示網格
+        for i in range(0, len(display_df), 3):
             cols = st.columns(3)
-            batch = filtered_df.iloc[i:i+3]
+            batch = display_df.iloc[i:i+3]
             for col, (_, row) in zip(cols, batch.iterrows()):
                 with col:
                     with st.container(border=True):
@@ -151,24 +175,63 @@ with tab1:
                         </div>""", unsafe_allow_html=True)
                         st.link_button("查看", row['Shop_Link'], use_container_width=True)
 
+        # --- ★ 底部按鈕式分頁 (Pagination Bar) ★ ---
+        st.markdown("<br><br>", unsafe_allow_html=True)
+        
+        # 產生頁碼列表邏輯 (1 2 3 ... 50)
+        current = st.session_state.page_number
+        if total_pages <= 7:
+            page_list = list(range(1, total_pages + 1))
+        else:
+            if current <= 4:
+                page_list = [1, 2, 3, 4, 5, "...", total_pages]
+            elif current >= total_pages - 3:
+                page_list = [1, "...", total_pages - 4, total_pages - 3, total_pages - 2, total_pages - 1, total_pages]
+            else:
+                page_list = [1, "...", current - 1, current, current + 1, "...", total_pages]
+
+        # 置中按鈕
+        total_cols = len(page_list) + 2
+        _, mid, _ = st.columns([2, total_cols, 2]) # 左右留白，中間放按鈕
+        
+        with mid:
+            cols = st.columns(total_cols)
+            # 上一頁
+            if cols[0].button("◀", disabled=(current == 1), key="prev_page"):
+                st.session_state.page_number -= 1
+                st.rerun()
+            
+            # 數字按鈕
+            for i, p in enumerate(page_list):
+                with cols[i + 1]:
+                    if p == "...":
+                        st.write("...")
+                    else:
+                        # 如果是當前頁，用 primary 顏色 (紅色)
+                        if st.button(str(p), key=f"page_{p}", type="primary" if p == current else "secondary"):
+                            st.session_state.page_number = p
+                            st.rerun()
+            
+            # 下一頁
+            if cols[-1].button("▶", disabled=(current == total_pages), key="next_page"):
+                st.session_state.page_number += 1
+                st.rerun()
+
 # ==========================================
-# Tab 2: 💬 AI 購車顧問 (核心邏輯)
+# Tab 2: 💬 AI 購車顧問 (保持最新版)
 # ==========================================
 with tab2:
     st.markdown("### 🤖 MotoBot 智慧助理")
     
-    # 狀態機初始化
     if "chat_stage" not in st.session_state:
         st.session_state.chat_stage = 0
         st.session_state.chat_data = {} 
         st.session_state.messages = [{"role": "assistant", "content": "你好！我是 MotoBot。(1/5) 請問您**居住在哪個縣市**？(例如：高雄、花蓮)"}]
 
-    # 顯示對話歷史 (這是對話框的主體)
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.write(msg["content"])
 
-    # 決定輸入框的提示文字
     current_placeholder = "請輸入回答..."
     stage = st.session_state.chat_stage
     if stage == 0: current_placeholder = "請輸入您的居住縣市 (例如: 高雄)..."
@@ -177,23 +240,21 @@ with tab2:
     elif stage == 3: current_placeholder = "請輸入: 是 / 否..."
     elif stage == 4: current_placeholder = "請輸入: 願意 / 不願意..."
 
-    # ★ 關鍵：使用 st.chat_input，它會自動固定在螢幕最下方 ★
     if prompt := st.chat_input(current_placeholder):
-        # 1. 顯示使用者輸入
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.write(prompt)
 
-        # 2. 狀態機邏輯 (處理您的 Q&A)
         response = ""
+        should_rerun = True 
         
-        # --- Q1: 地點 ---
+        # Q1: 地點
         if stage == 0:
             st.session_state.chat_data['location'] = prompt
             response = f"收到，您在 **{prompt}**。(2/5) 請問您的購車**預算上限**是多少？(例如：5萬)"
             st.session_state.chat_stage = 1
 
-        # --- Q2: 預算 ---
+        # Q2: 預算
         elif stage == 1:
             try:
                 nums = re.findall(r'\d+', prompt)
@@ -205,10 +266,12 @@ with tab2:
                     st.session_state.chat_stage = 2
                 else:
                     response = "不好意思，我沒讀到數字。請輸入數字預算 (例如：50000)"
+                    should_rerun = False
             except:
                 response = "請輸入有效的數字預算。"
+                should_rerun = False
 
-        # --- Q3: 用途 ---
+        # Q3: 用途
         elif stage == 2:
             st.session_state.chat_data['usage'] = prompt
             tag = "標準車款"
@@ -217,11 +280,10 @@ with tab2:
             elif any(k in prompt for k in ["長途", "環島"]): tag = "🛣️ 長途"
             elif any(k in prompt for k in ["檔車"]): tag = "🏍️ 檔車"
             st.session_state.chat_data['tag'] = tag
-            
             response = f"了解 ({tag})。(4/5) 安全性確認：您是否需要配備 **ABS 防鎖死煞車系統**？(請回答：需要/不需要)"
             st.session_state.chat_stage = 3
 
-        # --- Q4: ABS ---
+        # Q4: ABS
         elif stage == 3:
             need_abs = False
             if any(k in prompt for k in ["是", "要", "有", "需要", "yes", "y"]):
@@ -230,12 +292,11 @@ with tab2:
             else:
                 abs_msg = "⭕ 無強制 ABS"
             st.session_state.chat_data['abs'] = need_abs
-            
             user_loc = st.session_state.chat_data['location']
             response = f"好的 ({abs_msg})。(5/5) 最後一題：\n\n如果 **{user_loc}** 當地沒有符合的車，我們有些分店在其他縣市。您願意支付約 **$1500 託運費** 將車運過去嗎？(請回答：願意/不願意)"
             st.session_state.chat_stage = 4
 
-        # --- Q5: 運費 (完結) ---
+        # Q5: 運費 & 搜尋
         elif stage == 4:
             accept_shipping = False
             if any(k in prompt for k in ["願意", "好", "可", "yes", "ok"]):
@@ -243,7 +304,6 @@ with tab2:
             
             st.session_state.chat_data['shipping'] = accept_shipping
             
-            # --- 最終搜尋 ---
             final_df = df.copy()
             final_df = final_df[final_df['Price'] <= st.session_state.chat_data['budget']]
             if st.session_state.chat_data['abs']:
@@ -262,7 +322,6 @@ with tab2:
                 loc_text = f"僅限 {user_loc}"
 
             count = len(final_df)
-            
             response = f"""
             🎉 **分析完成！**
             - 📍 **範圍**：{loc_text}
@@ -275,7 +334,6 @@ with tab2:
             st.session_state.messages.append({"role": "assistant", "content": response})
             with st.chat_message("assistant"):
                 st.markdown(response)
-                
                 if count > 0:
                     cols = st.columns(3)
                     for i in range(min(count, 6)):
@@ -283,12 +341,10 @@ with tab2:
                         with cols[i % 3]:
                             with st.container(border=True):
                                 st.image(row['Image_URL'], use_container_width=True)
-                                
                                 tags_html = f'<span class="pill pill-loc">{row["Store"]}</span>'
                                 if "ABS" in row['Model']: tags_html += ' <span class="pill pill-abs">ABS</span>'
                                 if accept_shipping and user_loc not in row['Store']:
                                     tags_html += ' <span class="pill pill-ship">+$1500運</span>'
-                                
                                 st.markdown(f"""<div class="card-content">
                                     <div class="tag-box">{tags_html}</div>
                                     <div class="moto-title">{row["Model"]}</div>
@@ -299,20 +355,22 @@ with tab2:
                     st.error(f"抱歉，在 {loc_text} 找不到符合條件的車。\n建議：\n1. 增加預算\n2. 選擇「願意」接受託運")
 
             st.session_state.chat_stage = 5 
+            should_rerun = False 
 
-        # --- Q5: 結束/重置 ---
+        # Q5: 結束
         elif stage == 5:
             st.session_state.chat_stage = 0
             st.session_state.messages = [{"role": "assistant", "content": "🔄 已重置對話。請問您現在**居住在哪個縣市**？"}]
-            st.rerun()
+            should_rerun = True
 
-        # 輸出文字回應
         if stage != 4:
             st.session_state.messages.append({"role": "assistant", "content": response})
             with st.chat_message("assistant"):
                 st.write(response)
+        
+        if should_rerun:
+            st.rerun()
 
-    # ★ 關鍵：增加底部墊片，防止最後的訊息被輸入框擋住 ★
     st.markdown("<div style='height: 100px;'></div>", unsafe_allow_html=True)
 
 # ==========================================
@@ -344,10 +402,24 @@ with tab3:
                             st.link_button("查看", r['Shop_Link'], use_container_width=True)
             except: st.error("運算失敗")
 
-# --- Footer (這裡加了 padding 讓它不會被輸入框蓋住) ---
-st.markdown("<br><hr>", unsafe_allow_html=True)
+# ==========================================
+# Footer & 免責聲明
+# ==========================================
+st.divider()
+
+with st.expander("⚖️ 免責聲明與服務條款 (Terms of Service) - 點擊展開"):
+    st.markdown("""
+    <div class="disclaimer-text">
+    1. <b>資訊來源</b>：本平台之車輛資料皆由程式自動抓取自第三方網站，僅供學術研究使用。<br>
+    2. <b>準確性聲明</b>：本平台不保證資訊之即時性與正確性。實際車況請以店家現場為主。<br>
+    3. <b>交易責任</b>：本平台僅提供資訊媒合服務，不參與實際買賣。任何交易糾紛請直接與車行聯繫。<br>
+    4. <b>安全提醒</b>：購買二手車輛強烈建議親自試乘、檢查車況，並簽署正式購車合約。
+    </div>
+    """, unsafe_allow_html=True)
+
 st.markdown("""
-<div style='text-align:center;color:gray; margin-bottom: 60px;'>
-    MotoMatch © 2026 | Designed by MIS Team
+<div style='text-align:center; color:#94a3b8; font-size: 0.8rem; margin-top: 10px; margin-bottom: 80px;'>
+    MotoMatch AI System © 2026 | Designed by MIS Team<br>
+    <span style='font-size: 0.7rem;'>本專題僅供學術交流，非營利目的</span>
 </div>
 """, unsafe_allow_html=True)
