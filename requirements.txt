@@ -4,3 +4,4 @@ numpy
 requests
 beautifulsoup4
 plotly
+streamlit-javascript
