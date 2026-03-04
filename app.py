@@ -3,252 +3,156 @@ import pandas as pd
 import numpy as np
 import os
 import re
+import json
+from streamlit_javascript import st_javascript # 需安裝：pip install streamlit-javascript
 
 # --- 1. 網頁設定與數據載入 ---
 st.set_page_config(page_title="MotoMatch AI - 智慧購車顧問", page_icon="🛵", layout="wide")
 
-# 台灣縣市白名單 (用於嚴格地址攔截與地理推薦)
-taiwan_cities = [
-    "台北", "新北", "基隆", "桃園", "新竹", "苗栗", "台中", "彰化", 
-    "南投", "雲林", "嘉義", "台南", "高雄", "屏東", "宜蘭", "花蓮", 
-    "台東", "澎湖", "金門", "連江"
-]
-
 @st.cache_data 
 def load_data():
     try:
-        # 讀取標記資料
         df = pd.read_csv("labeled_data.csv")
-        # 品牌自動識別 (確保規格表不顯示「其他」)
-        brand_map = {
-            "山葉": ["YAMAHA", "山葉", "R15", "MT", "勁戰", "FORCE", "BWS", "AUGUR"],
-            "三陽": ["SYM", "三陽", "DRG", "JET", "曼巴", "MMBCU", "FIDDLE", "CLBCU"],
-            "光陽": ["KYMCO", "光陽", "KRV", "雷霆", "MANY", "VJR", "ROMA"],
-            "偉士牌": ["VESPA", "偉士牌", "春天", "衝刺", "PRIMAVERA", "SPRINT"],
-            "睿能": ["GOGORO", "睿能", "VIVA", "MIX", "DELIGHT"]
-        }
-        def fix_brand(row):
+        # 品牌識別與進階規格標籤 (ABS/TCS)
+        brand_map = {"山葉": ["YAMAHA", "R15", "MT", "勁戰"], "三陽": ["SYM", "DRG", "JET", "曼巴"], "光陽": ["KYMCO", "KRV", "雷霆"]}
+        def augment_data(row):
             m = str(row['Model']).upper()
-            for b_name, keywords in brand_map.items():
-                if any(k.upper() in m for k in keywords): return b_name
-            return row.get('Brand', '其他')
-        
-        df['Brand'] = df.apply(fix_brand, axis=1)
+            row['ABS'] = True if any(x in m for x in ["ABS", "GR", "MMBCU", "DRG", "AUGUR"]) else False
+            row['TCS'] = True if any(x in m for x in ["TCS", "MMBCU", "DRG"]) else False
+            for b, k in brand_map.items():
+                if any(x.upper() in m for x in k): row['Brand'] = b; break
+            return row
+        df = df.apply(augment_data, axis=1)
         df['Price'] = pd.to_numeric(df['Price'], errors='coerce').fillna(0)
         df['id'] = df.index
-        if 'Style' not in df.columns: df['Style'] = "一般通勤"
         return df
     except:
-        return pd.DataFrame(columns=['id', 'Store', 'Brand', 'Style', 'Model', 'Price', 'Image_URL', 'Shop_Link'])
+        return pd.DataFrame(columns=['id', 'Store', 'Brand', 'Model', 'Price', 'Image_URL', 'Shop_Link', 'ABS', 'TCS'])
 
 df = load_data()
 
-# --- 2. 相似度演算法 (推薦核心) ---
-@st.cache_resource
-def build_similarity_model(data):
-    if len(data) < 2: return np.zeros((len(data), len(data)))
-    max_price = data['Price'].max() if data['Price'].max() > 0 else 1
-    price_norm = data[['Price']] / max_price
-    brands_ohe = pd.get_dummies(data['Brand']) * 0.5
-    styles_ohe = pd.get_dummies(data['Style']) * 1.0
-    features = np.hstack([price_norm.values, brands_ohe.values, styles_ohe.values])
-    norm = np.linalg.norm(features, axis=1, keepdims=True)
-    norm = np.where(norm == 0, 1, norm)
-    features_normalized = features / norm
-    return np.dot(features_normalized, features_normalized.T)
+# --- 2. Cookie (LocalStorage) 持久化邏輯 ---
+# 這裡使用 JavaScript 來讀取與寫入瀏覽器本地儲存，達成「隔天打開還在」的需求
+def sync_cookie():
+    # 讀取 LocalStorage
+    js_read = "parent.localStorage.getItem('moto_history');"
+    stored_data = st_javascript(js_read)
+    if stored_data and 'view_history' not in st.session_state:
+        st.session_state.view_history = json.loads(stored_data)
 
-# --- 3. 初始化 Session State ---
-if 'messages' not in st.session_state:
-    st.session_state.messages = [{"role": "assistant", "content": "你好！我是 MotoBot。(1/5) 請問您居住在哪個縣市？"}]
-if 'chat_stage' not in st.session_state: st.session_state.chat_stage = 0
-if 'chat_data' not in st.session_state: st.session_state.chat_data = {}
-if 'liked_cars' not in st.session_state: st.session_state.liked_cars = []
+def save_to_cookie(data_list):
+    # 寫入 LocalStorage
+    js_write = f"parent.localStorage.setItem('moto_history', '{json.dumps(data_list)}');"
+    st_javascript(js_write)
+
+# --- 3. 推薦演算法 (死忠於歷史總和) ---
+def get_loyal_recommendations(history, data):
+    if not history: return pd.DataFrame()
+    # 計算歷史特徵總和
+    hist_df = pd.DataFrame(history)
+    avg_price = hist_df['Price'].mean()
+    fav_brand = hist_df['Brand'].mode()[0] if not hist_df['Brand'].empty else None
+    prefers_abs = (hist_df['ABS'] == True).sum() > (len(hist_df) / 2)
+    
+    # 過濾與歷史特徵相近的車
+    mask = (data['Price'] >= avg_price * 0.8) & (data['Price'] <= avg_price * 1.2)
+    if fav_brand: mask &= (data['Brand'] == fav_brand)
+    if prefers_abs: mask &= (data['ABS'] == True)
+    
+    return data[mask].head(6)
+
+# --- 4. 初始化 Session State ---
+sync_cookie() # 啟動時讀取 Cookie
 if 'view_history' not in st.session_state: st.session_state.view_history = []
-if 'current_page' not in st.session_state: st.session_state.current_page = 1
+if 'liked_cars' not in st.session_state: st.session_state.liked_cars = []
+if 'chat_stage' not in st.session_state: st.session_state.chat_stage = 0
+if 'messages' not in st.session_state:
+    st.session_state.messages = [{"role": "assistant", "content": "你好！我是 MotoBot。我已準備好為您紀錄購車偏好，您同意開啟 Cookie 記憶功能嗎？"}]
 
-# --- 4. 側邊欄 ---
-with st.sidebar:
-    st.title("📍 系統設定")
-    selected_region = st.selectbox("所在分店", ["全台分店"] + sorted(list(df['Store'].unique() if not df.empty else [])))
-    st.divider()
-    liked_count = len(st.session_state.liked_cars)
-    with st.expander(f"❤️ 關注清單 ({liked_count})", expanded=True):
-        if not st.session_state.liked_cars: st.caption("尚未收藏車輛")
-        else:
-            for i, car in enumerate(st.session_state.liked_cars):
-                st.write(f"**{car['Model']}**")
-                if st.button("❌ 移除", key=f"side_del_{car['id']}"):
-                    st.session_state.liked_cars.pop(i); st.rerun()
-
-# --- 5. 主介面標籤頁 ---
-st.title("🛵 MotoMatch AI 智慧導購")
+# --- 5. 主介面標籤頁配置 ---
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["💬 AI 顧問", "🏠 現場庫存", "🔮 猜你喜歡", "⚖️ 規格比較", "🕒 最近瀏覽"])
 
 # ==========================================
-# Tab 1: 💬 AI 顧問 (預算、ABS與地理過濾細節)
-# ==========================================
-with tab1:
-    if st.button("🔄 重製對話"):
-        st.session_state.chat_stage = 0
-        st.session_state.chat_data = {}
-        st.session_state.messages = [{"role": "assistant", "content": "你好！我是 MotoBot。(1/5) 請問您居住在哪個縣市？"}]
-        st.rerun()
-
-    for msg in st.session_state.messages:
-        with st.chat_message(msg["role"]): st.write(msg["content"])
-
-    stage = st.session_state.chat_stage
-    if stage < 5 and (prompt := st.chat_input("請回答...")):
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        
-        # --- Stage 0: 嚴格地址攔截 ---
-        if stage == 0:
-            user_loc = next((city for city in taiwan_cities if city in prompt), None)
-            if user_loc:
-                st.session_state.chat_data['location'] = user_loc
-                st.session_state.chat_stage = 1
-                response = f"收到，您在 **{user_loc}**。(2/5) 預算上限是多少？(例如：8萬 或 85000)"
-            else:
-                response = "📍 抱歉，目前的服務僅限台灣地區。請輸入正確的台灣縣市名稱。"
-        
-        # --- Stage 1: 預算數字解析 ---
-        elif stage == 1:
-            try:
-                clean = prompt.replace('萬', '0000').replace(',', '').replace(' ', '')
-                nums = re.findall(r'\d+', clean)
-                val = int(nums[0])
-                final_budget = val * 10000 if val < 200 else val
-                st.session_state.chat_data['budget'] = final_budget
-                st.session_state.chat_stage = 2
-                response = f"預算已設定為 **${final_budget:,.0f}**。接下來 (3/5) 主要用途是？"
-            except:
-                response = "🔢 請輸入有效的數字金額。"
-        
-        # --- Stage 2: 用途 ---
-        elif stage == 2:
-            st.session_state.chat_data['usage'] = prompt
-            st.session_state.chat_stage = 3
-            response = "(4/5) 需要 **ABS 安全系統** 嗎？(如果不清楚可以問：什麼是 ABS？)"
-        
-        # --- Stage 3: ABS 科普細節 ---
-        elif stage == 3:
-            if any(k in prompt for k in ["什麼", "不懂", "?", "科普", "是啥"]):
-                response = "🛡️ **MotoBot 小百科**：ABS 能防止急煞時輪胎鎖死導致打滑，是雨天或緊急狀況的保命關鍵！您覺得需要配備嗎？"
-            else:
-                st.session_state.chat_data['abs'] = any(k in prompt for k in ["要", "是", "需", "有"])
-                st.session_state.chat_stage = 4
-                response = "(5/5) 若心儀車款在其他縣市，願意付 $1500 跨店調車費嗎？"
-        
-        # --- Stage 4: 地理調度意願 ---
-        elif stage == 4:
-            is_negative = any(n in prompt for n in ["不", "否", "沒", "拒絕"])
-            st.session_state.chat_data['shipping'] = not is_negative
-            st.session_state.chat_stage = 5
-            response = "🎉 分析完成！推薦結果如下："
-        
-        st.session_state.messages.append({"role": "assistant", "content": response})
-        st.rerun()
-
-    if stage == 5:
-        st.divider()
-        u_loc = st.session_state.chat_data.get('location', '')
-        u_shipping = st.session_state.chat_data.get('shipping', True)
-        u_budget = st.session_state.chat_data.get('budget', 150000)
-        
-        # 嚴格篩選邏輯
-        rec_df = df[df['Price'] <= u_budget]
-        if not u_shipping:
-            rec_df = rec_df[rec_df['Store'].str.contains(u_loc, na=False)]
-        
-        if rec_df.empty:
-            st.warning(f"目前在 **{u_loc}** 門市暫無符合預算的車款。建議調整條件或選擇願意調度。")
-        else:
-            cols = st.columns(3)
-            for i, (_, row) in enumerate(rec_df.head(6).iterrows()):
-                with cols[i % 3]:
-                    with st.container(border=True):
-                        st.image(row['Image_URL'], use_container_width=True)
-                        st.subheader(f"💰 ${int(row['Price']):,}")
-                        st.write(f"**{row['Model']}**")
-                        st.caption(f"📍 {row['Store']}")
-                        st.link_button("👉 查看詳情", row['Shop_Link'], use_container_width=True)
-
-# ==========================================
-# Tab 2: 🏠 現場庫存 (1-60 分頁)
+# Tab 2: 🏠 現場庫存 (大卡片)
 # ==========================================
 with tab2:
-    current_df = df[df['Store'] == selected_region] if selected_region != "全台分店" else df
-    items_per_page = 12
-    total_pages = max(1, (len(current_df) - 1) // items_per_page + 1)
-    if st.session_state.current_page > total_pages: st.session_state.current_page = 1
-    
-    start_idx = (st.session_state.current_page - 1) * items_per_page
-    page_df = current_df.iloc[start_idx : start_idx + items_per_page]
-    
     cols = st.columns(3)
-    for i, (_, row) in enumerate(page_df.iterrows()):
+    for i, (_, row) in enumerate(df.head(12).iterrows()):
         with cols[i % 3]:
             with st.container(border=True):
                 st.image(row['Image_URL'], use_container_width=True)
                 st.subheader(f"💰 NT$ {int(row['Price']):,}")
-                st.markdown(f"**{row['Model']}**")
-                
-                c1, c2 = st.columns(2)
-                if c1.button("❤️ 關注", key=f"fav_{row['id']}"):
+                st.write(f"**{row['Model']}**")
+                if st.button("❤️ 關注並紀錄", key=f"main_{row['id']}"):
                     car_dict = row.to_dict()
+                    # 更新關注清單
                     if car_dict['id'] not in [c['id'] for c in st.session_state.liked_cars]:
                         st.session_state.liked_cars.append(car_dict)
+                    # 更新瀏覽紀錄 (Cookie)
                     if car_dict['id'] not in [c['id'] for c in st.session_state.view_history]:
                         st.session_state.view_history.append(car_dict)
+                        save_to_cookie(st.session_state.view_history)
                     st.rerun()
-                c2.link_button("🌐 網站", row['Shop_Link'], use_container_width=True)
-
-    st.divider()
-    p_cols = st.columns(min(total_pages, 12) + 2)
-    for i, p in enumerate(range(max(1, st.session_state.current_page-5), min(total_pages, st.session_state.current_page+5)+1)):
-        label = f"★{p}" if p == st.session_state.current_page else str(p)
-        if p_cols[i+1].button(label, key=f"pg_{p}"):
-            st.session_state.current_page = p; st.rerun()
 
 # ==========================================
-# Tab 3: 🔮 猜你喜歡 (推薦演算法)
+# Tab 5: 🕒 最近瀏覽 (中/小卡片 + ABS/TCS 標籤)
 # ==========================================
-with tab3:
-    if not st.session_state.liked_cars: st.info("請先關注車子")
-    else:
-        target = st.session_state.liked_cars[-1]
-        sim_model = build_similarity_model(df)
-        idx = df[df['id'] == target['id']].index[0]
-        scores = sorted(list(enumerate(sim_model[idx])), key=lambda x: x[1], reverse=True)[1:7]
-        cols = st.columns(3)
-        for i, (s_idx, _) in enumerate(scores):
-            r = df.iloc[s_idx]
-            with cols[i % 3]:
-                with st.container(border=True):
-                    st.image(r['Image_URL'], use_container_width=True)
-                    st.subheader(f"💰 ${int(r['Price']):,}")
-                    st.write(r['Model'])
-
-# ==========================================
-# Tab 4: ⚖️ 規格比較 & Tab 5: 最近瀏覽
-# ==========================================
-with tab4:
-    st.header("⚖️ 車款規格對照")
-    if len(st.session_state.liked_cars) < 2: st.info("請關注至少 2 台車。")
-    else:
-        comp_df = pd.DataFrame(st.session_state.liked_cars)[["Model", "Price", "Brand", "Store"]]
-        comp_df.columns = ["型號", "售價", "品牌", "所在地"]
-        comp_df["售價"] = comp_df["售價"].apply(lambda x: f"${int(x):,}")
-        st.table(comp_df.set_index("型號").T)
-
 with tab5:
-    st.header("🕒 最近查看紀錄")
-    if not st.session_state.view_history: st.info("尚無紀錄。")
+    st.header("🕒 您所有看過的愛車 (已儲存至 Cookie)")
+    if st.button("🗑️ 清除所有記憶"):
+        st.session_state.view_history = []
+        save_to_cookie([])
+        st.rerun()
+    
+    if not st.session_state.view_history:
+        st.info("尚無歷史紀錄，您的購車 DNA 正在孵化中...")
     else:
-        v_cols = st.columns(3)
-        for i, car in enumerate(reversed(st.session_state.view_history[-9:])):
-            with v_cols[i % 3]:
+        # 分類顯示：今天、更早以前
+        st.write("### 📅 歷史總覽")
+        v_cols = st.columns(5) # 中/小卡片：一列 5 欄
+        for i, car in enumerate(reversed(st.session_state.view_history)):
+            with v_cols[i % 5]:
                 with st.container(border=True):
                     st.image(car['Image_URL'], use_container_width=True)
-                    st.write(f"**{car['Model']}**")
-                    st.subheader(f"💰 ${int(car['Price']):,}")
+                    st.caption(f"**{car['Model']}**")
+                    st.write(f"NT$ {int(car['Price']):,}")
+                    # A 方案標籤：顯示 ABS / TCS
+                    tag_html = ""
+                    if car.get('ABS'): tag_html += "🛡️ ABS "
+                    if car.get('TCS'): tag_html += "🛣️ TCS"
+                    st.markdown(f"<small>{tag_html}</small>", unsafe_allow_html=True)
+
+# ==========================================
+# Tab 3: 🔮 猜你喜歡 (死忠推薦)
+# ==========================================
+with tab3:
+    st.header("🔮 根據您的購車 DNA 推薦")
+    if not st.session_state.view_history:
+        st.warning("⚠️ 提示：請先在商場點擊❤️，系統將根據您的長期歷史總和進行死忠推薦。")
+    else:
+        # 顯示 DNA 分析訊息
+        hist_df = pd.DataFrame(st.session_state.view_history)
+        fav_brand = hist_df['Brand'].mode()[0]
+        st.success(f"MotoBot 觀察：您歷史紀錄中有 {len(hist_df)} 筆資料，其中最常看的是 **{fav_brand}**。")
+        
+        recs = get_loyal_recommendations(st.session_state.view_history, df)
+        r_cols = st.columns(3)
+        for i, (_, row) in enumerate(recs.iterrows()):
+            with r_cols[i % 3]:
+                with st.container(border=True):
+                    st.image(row['Image_URL'], use_container_width=True)
+                    st.write(f"**{row['Model']}**")
+                    st.write(f"💰 ${int(row['Price']):,}")
+
+# ==========================================
+# Tab 4: ⚖️ 規格比較 (✅/❌ 直觀比較)
+# ==========================================
+with tab4:
+    st.header("⚖️ 規格直觀比對")
+    if len(st.session_state.liked_cars) < 2:
+        st.info("請至少關注 2 台車以進行比對。")
+    else:
+        comp_df = pd.DataFrame(st.session_state.liked_cars)[["Model", "Price", "Brand", "ABS", "TCS"]]
+        comp_df['ABS'] = comp_df['ABS'].map({True: "✅ 有", False: "❌ 無"})
+        comp_df['TCS'] = comp_df['TCS'].map({True: "✅ 有", False: "❌ 無"})
+        st.table(comp_df.set_index("Model").T)
